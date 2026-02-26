@@ -1022,11 +1022,14 @@ def _compat_qwen3_vl_mixed_data(model, processor, is_moe: bool = False):
             **kwargs,
         )
 
-        return output_cls(
+        result_kwargs = dict(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             rope_deltas=self.rope_deltas,
         )
+        if is_moe:
+            result_kwargs['router_logits'] = getattr(outputs, 'router_logits', None)
+        return output_cls(**result_kwargs)
 
     model.origin_forward = model.forward
     model.forward = MethodType(forward, model)
@@ -1082,7 +1085,10 @@ class Qwen3VLMoeLoader(Qwen3VLLoader):
         from transformers import Qwen3VLMoeForConditionalGeneration
         self.auto_model_cls = self.auto_model_cls or Qwen3VLMoeForConditionalGeneration
         patch_Qwen3VLMoeTextExperts_dtype()
-        return super().get_model(model_dir, config, processor, model_kwargs)
+        self._check_qwen_vl_utils()
+        model = Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+        _compat_qwen3_vl_mixed_data(model.model, processor, is_moe=True)
+        return model
 
 
 register_model(
