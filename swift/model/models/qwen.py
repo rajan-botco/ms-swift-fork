@@ -1029,7 +1029,11 @@ def _compat_qwen3_vl_mixed_data(model, processor, is_moe: bool = False):
         )
         if is_moe:
             result_kwargs['router_logits'] = getattr(outputs, 'router_logits', None)
-        return output_cls(**result_kwargs)
+        try:
+            return output_cls(**result_kwargs)
+        except TypeError:
+            result_kwargs.pop('router_logits', None)
+            return output_cls(**result_kwargs)
 
     model.origin_forward = model.forward
     model.forward = MethodType(forward, model)

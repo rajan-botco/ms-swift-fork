@@ -1,12 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .agent import AgentFlanLossScale, AlphaUmiLossScale, HermesLossScale, QwenLossScale, REACTLossScale
 from .base import ALL_BASE_STRATEGY, LossScale
-from .other import IgnoreEmptyThinkLossScale
+from .other import IgnoreEmptyThinkLossScale, ThinkMaskLossScale
 
 # Add your loss scale here, use --loss_scale xxx to train
 loss_scale_map = {
     'base': LossScale,
     'ignore_empty_think': IgnoreEmptyThinkLossScale,
+    'think_mask': ThinkMaskLossScale,
     # agent
     'react': REACTLossScale,
     'hermes': HermesLossScale,
