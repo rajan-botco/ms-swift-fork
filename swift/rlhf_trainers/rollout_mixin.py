@@ -648,15 +648,15 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
     def _move_full_model_to_vllm(self):
         """Transfer full model weights to vLLM engine.
 
-        Manages the lifecycle of gather and merge/unmerge per parameter_group:
-        - gather_if_zero3: per parameter_group batch (DeepSpeed Zero3)
-        - merge/unmerge: per parameter_group (must be within gather context)
-        - No clone needed: unmerge happens after load completes
+        Includes synchronization barriers before each gather and a retry
+        mechanism for non-deterministic NaN corruption in GatheredParameters
+        (caused by incomplete CPU-GPU DMA from ZeRO-3 optimizer offload).
         """
         is_peft = is_peft_model(self.model)
         should_merge = is_peft and not self._is_fsdp2
 
         gather_if_zero3 = get_gather_if_zero3_context(self)
+        max_attempts = int(os.environ.get('SWIFT_GATHER_RETRIES', '3'))
 
         for i, parameter_group in enumerate(self.parameter_groups):
             parameter_group_no_lora = self.parameter_groups_no_lora[i]
@@ -669,18 +669,71 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             else:
                 parameters = []
 
-            with gather_if_zero3(parameters):
-                if should_merge:
-                    with patch_lora_merge(self.model, parameter_group):
-                        self.model.merge_adapter()
+            for attempt in range(max_attempts):
+                torch.cuda.synchronize()
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
 
-                try:
-                    state_dict = self._collect_state_dict_for_vllm(parameter_group, parameter_group_no_lora)
-                    self._load_state_dict_to_vllm(state_dict)
-                finally:
+                with gather_if_zero3(parameters):
+                    torch.cuda.synchronize()
+
                     if should_merge:
-                        with patch_lora_unmerge(self.model):
-                            self.model.unmerge_adapter()
+                        with patch_lora_merge(self.model, parameter_group):
+                            self.model.merge_adapter()
+
+                    try:
+                        state_dict = self._collect_state_dict_for_vllm(
+                            parameter_group, parameter_group_no_lora)
+
+                        has_nan = torch.tensor(
+                            0, dtype=torch.int32,
+                            device=self.accelerator.device)
+                        if self.accelerator.is_main_process:
+                            bad_params = [
+                                k for k, v in state_dict.items()
+                                if torch.is_tensor(v)
+                                and (v.isnan().any() or v.isinf().any())]
+                            if bad_params:
+                                has_nan.fill_(1)
+                        else:
+                            bad_params = []
+
+                        if torch.distributed.is_initialized():
+                            torch.distributed.broadcast(
+                                has_nan, src=0)
+                        should_retry = (has_nan.item() == 1
+                                        and attempt < max_attempts - 1)
+
+                        if should_retry:
+                            if bad_params:
+                                logger.warning(
+                                    f'[weight_sync] NaN in {len(bad_params)} '
+                                    f'params (attempt {attempt+1}/'
+                                    f'{max_attempts}), retrying. '
+                                    f'Affected: {bad_params[:5]}')
+                            del state_dict
+                            continue
+
+                        if bad_params:
+                            logger.error(
+                                f'[weight_sync] NaN persists after '
+                                f'{max_attempts} attempts in '
+                                f'{len(bad_params)} params. '
+                                f'Sanitizing NaN->0: {bad_params[:5]}')
+                            for k in bad_params:
+                                state_dict[k].nan_to_num_(
+                                    nan=0.0, posinf=0.0, neginf=0.0)
+                        elif attempt > 0:
+                            logger.info(
+                                f'[weight_sync] Gather clean on attempt '
+                                f'{attempt+1} (group={i})')
+
+                        self._load_state_dict_to_vllm(state_dict)
+                        break
+                    finally:
+                        if should_merge:
+                            with patch_lora_unmerge(self.model):
+                                self.model.unmerge_adapter()
 
         if is_peft:
             self.base_sync_done = True

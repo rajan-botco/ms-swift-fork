@@ -254,7 +254,8 @@ class SftArguments(SwanlabArguments, TunerArguments, BaseArguments, Seq2SeqTrain
             ds_config_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config'))
             deepspeed_mapping = {
                 name: f'{name}.json'
-                for name in ['zero0', 'zero1', 'zero2', 'zero3', 'zero2_offload', 'zero3_offload']
+                for name in ['zero0', 'zero1', 'zero2', 'zero3', 'zero2_offload', 'zero3_offload',
+                             'zero3_optim_offload']
             }
             for ds_name, ds_config in deepspeed_mapping.items():
                 if self.deepspeed == ds_name:

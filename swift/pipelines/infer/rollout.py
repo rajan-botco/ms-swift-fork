@@ -231,51 +231,17 @@ class WeightSyncWorkerExtension:
         _log = get_logger()
         _log.info(f'[weight_sync] Received {len(named_params)} params, '
                    f'total elements: {flatten_tensor_length}')
-        expert_keys = [k for k in named_params if 'experts' in k]
-        non_expert_keys = [k for k in named_params if 'experts' not in k]
-        _log.info(f'[weight_sync] Expert params: {len(expert_keys)}, '
-                   f'non-expert params: {len(non_expert_keys)}')
-        for k in sorted(expert_keys)[:6]:
-            t = named_params[k]
-            _log.info(f'[weight_sync]   expert: {k} shape={list(t.shape)} '
-                       f'norm={t.float().norm().item():.4f} '
-                       f'has_nan={t.isnan().any().item()} has_inf={t.isinf().any().item()}')
-        for k in sorted(non_expert_keys)[:6]:
-            t = named_params[k]
-            _log.info(f'[weight_sync]   non-expert: {k} shape={list(t.shape)} '
-                       f'norm={t.float().norm().item():.4f}')
 
-        pre_norms = {}
-        vllm_params = dict(self.model_runner.model.named_parameters())
-        for pname in ['w13_weight', 'w2_weight']:
-            matches = [k for k in vllm_params if pname in k]
-            if matches:
-                p = vllm_params[matches[0]]
-                pre_norms[matches[0]] = p.data.float().norm().item()
-                _log.info(f'[weight_sync] PRE-load vllm {matches[0]} '
-                           f'norm={pre_norms[matches[0]]:.4f}')
+        if flatten_tensor.isnan().any() or flatten_tensor.isinf().any():
+            bad = [k for k in named_params
+                   if named_params[k].isnan().any() or named_params[k].isinf().any()]
+            _log.error(f'[weight_sync] DETECTED {len(bad)} NaN/Inf params from trainer! '
+                       f'This indicates a DeepSpeed ZeRO-3 buffer corruption. '
+                       f'Affected: {bad[:5]}')
 
-        # Patch MoE weight_loader if needed
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
-        # Load the reconstructed parameters into the model
         loaded = self.model_runner.model.load_weights(weights=list(named_params.items()))
-
-        _log.info(f'[weight_sync] load_weights returned {len(loaded)} loaded param names')
-        sent_basenames = set()
-        for k in named_params:
-            parts = k.rsplit('.', 1)
-            sent_basenames.add(k)
-        not_loaded = sent_basenames - loaded
-        if not_loaded:
-            _log.warning(f'[weight_sync] {len(not_loaded)} params NOT loaded: '
-                          f'{sorted(not_loaded)[:10]}')
-
-        for pname, pre_norm in pre_norms.items():
-            p = vllm_params[pname]
-            post_norm = p.data.float().norm().item()
-            _log.info(f'[weight_sync] POST-load vllm {pname} '
-                       f'norm={post_norm:.4f} (was {pre_norm:.4f}, '
-                       f'delta={abs(post_norm - pre_norm):.6f})')
+        _log.info(f'[weight_sync] Loaded {len(loaded)} params')
 
     def close_communicator(self) -> None:
         """
