@@ -619,12 +619,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     param = param.full_tensor()
                 raw_state_dict[name] = param
         else:
-            # DeepSpeed: use named_parameters + param.data
-            # No clone needed: unmerge happens after _load_state_dict_to_vllm completes
+            # DeepSpeed ZeRO-3: clone gathered params to avoid holding views
+            # of internal all-gather buffers which can become stale/corrupted
             for name, param in self.model.named_parameters():
                 if parameter_group and name not in parameter_group:
                     continue
-                raw_state_dict[name] = param.data
+                raw_state_dict[name] = param.data.clone()
 
         # Process: clean names, filter adapters (keep LoRA for FSDP2 to merge at tensor level)
         state_dict = self._process_state_dict_for_vllm(
@@ -648,15 +648,17 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
     def _move_full_model_to_vllm(self):
         """Transfer full model weights to vLLM engine.
 
-        Includes synchronization barriers before each gather and a retry
-        mechanism for non-deterministic NaN corruption in GatheredParameters
-        (caused by incomplete CPU-GPU DMA from ZeRO-3 optimizer offload).
+        Uses a per-parameter gather strategy to avoid overwhelming NCCL with
+        a single massive all-gather (which causes NaN corruption on large MoE
+        models with ZeRO-3).  If NaN persists after retries, sanitizes the
+        affected values to 0.0 and loads anyway to keep vLLM in sync.
         """
         is_peft = is_peft_model(self.model)
         should_merge = is_peft and not self._is_fsdp2
 
         gather_if_zero3 = get_gather_if_zero3_context(self)
-        max_attempts = int(os.environ.get('SWIFT_GATHER_RETRIES', '3'))
+        max_attempts = int(os.environ.get('SWIFT_GATHER_RETRIES', '5'))
+        retry_sleep = float(os.environ.get('SWIFT_GATHER_RETRY_SLEEP', '2.0'))
 
         for i, parameter_group in enumerate(self.parameter_groups):
             parameter_group_no_lora = self.parameter_groups_no_lora[i]
@@ -674,6 +676,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
 
+                if attempt > 0:
+                    time.sleep(retry_sleep * attempt)
+                    torch.cuda.synchronize()
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
+
                 with gather_if_zero3(parameters):
                     torch.cuda.synchronize()
 
@@ -685,22 +693,18 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                         state_dict = self._collect_state_dict_for_vllm(
                             parameter_group, parameter_group_no_lora)
 
-                        has_nan = torch.tensor(
-                            0, dtype=torch.int32,
-                            device=self.accelerator.device)
+                        bad_params = []
                         if self.accelerator.is_main_process:
                             bad_params = [
                                 k for k, v in state_dict.items()
                                 if torch.is_tensor(v)
                                 and (v.isnan().any() or v.isinf().any())]
-                            if bad_params:
-                                has_nan.fill_(1)
-                        else:
-                            bad_params = []
 
+                        has_nan = torch.tensor(
+                            1 if bad_params else 0, dtype=torch.int32,
+                            device=self.accelerator.device)
                         if torch.distributed.is_initialized():
-                            torch.distributed.broadcast(
-                                has_nan, src=0)
+                            torch.distributed.broadcast(has_nan, src=0)
                         should_retry = (has_nan.item() == 1
                                         and attempt < max_attempts - 1)
 
@@ -709,17 +713,19 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                                 logger.warning(
                                     f'[weight_sync] NaN in {len(bad_params)} '
                                     f'params (attempt {attempt+1}/'
-                                    f'{max_attempts}), retrying. '
+                                    f'{max_attempts}), retrying in '
+                                    f'{retry_sleep*(attempt+1):.0f}s. '
                                     f'Affected: {bad_params[:5]}')
                             del state_dict
                             continue
 
                         if bad_params:
-                            logger.error(
-                                f'[weight_sync] NaN persists after '
-                                f'{max_attempts} attempts in '
-                                f'{len(bad_params)} params. '
-                                f'Sanitizing NaN->0: {bad_params[:5]}')
+                            logger.warning(
+                                f'[weight_sync] NaN in {len(bad_params)} '
+                                f'params after {max_attempts} attempts '
+                                f'(group={i}). Sanitizing and loading '
+                                f'to keep vLLM current. '
+                                f'Affected: {bad_params[:5]}')
                             for k in bad_params:
                                 state_dict[k].nan_to_num_(
                                     nan=0.0, posinf=0.0, neginf=0.0)

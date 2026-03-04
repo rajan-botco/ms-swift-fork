@@ -1853,10 +1853,74 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
     def training_step(self, model: nn.Module, inputs: DataType, num_items_in_batch=None) -> torch.Tensor:
         if self.args.async_generate:
-            # Wait for the eval rollout to complete
             while not self.is_async_generate_eval_rollout_done():
                 time.sleep(0.1)
-        return super().training_step(model, inputs, num_items_in_batch)
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        self._sanitize_nan_params()
+        return loss
+
+    def _sanitize_nan_params(self):
+        """Check local parameter shards for NaN/Inf and zero them out.
+
+        With DeepSpeed ZeRO-3, param.data is a tiny placeholder between
+        forward passes — the real shard lives in param.ds_tensor.  We must
+        check (and fix) ds_tensor directly, otherwise NaN goes undetected
+        and cascades through GatheredParameters / optimizer state.
+
+        When NaN is found, we also reset Adam optimizer states (momentum
+        and variance) to prevent the 0*NaN=NaN cascade where corrupted
+        optimizer state re-corrupts weights on every subsequent step.
+        """
+        nan_names = []
+        for name, param in self.model.named_parameters():
+            shard = getattr(param, 'ds_tensor', None)
+            if shard is not None:
+                if shard.data.numel() > 0 and (shard.data.isnan().any() or shard.data.isinf().any()):
+                    nan_frac = shard.data.isnan().sum().item() / max(shard.data.numel(), 1)
+                    shard.data.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                    nan_names.append(f'{name}({nan_frac:.2%})')
+            elif param.data.numel() > 0 and (param.data.isnan().any() or param.data.isinf().any()):
+                param.data.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                nan_names.append(name)
+        if nan_names:
+            logger.warning(
+                f'[nan_sanitize] Cleaned NaN/Inf from {len(nan_names)} '
+                f'param shards at step {self.state.global_step}: '
+                f'{nan_names[:10]}')
+            self._reset_optimizer_states()
+
+    def _reset_optimizer_states(self):
+        """Reset Adam optimizer states after NaN contamination.
+
+        With Adam, even lr=0 cannot prevent NaN propagation because
+        0 * NaN = NaN in IEEE 754.  Once momentum (exp_avg) or variance
+        (exp_avg_sq) contains NaN, every subsequent step will re-corrupt
+        the weights.  Zeroing these states breaks the cycle.
+        """
+        try:
+            ds_engine = self.model
+            ds_optimizer = getattr(ds_engine, 'optimizer', None)
+            if ds_optimizer is None:
+                return
+            inner_opt = getattr(ds_optimizer, 'optimizer', None)
+            if inner_opt is None:
+                return
+            reset_count = 0
+            for state_val in inner_opt.state.values():
+                if not isinstance(state_val, dict):
+                    continue
+                for key in ('exp_avg', 'exp_avg_sq'):
+                    buf = state_val.get(key)
+                    if buf is not None and isinstance(buf, torch.Tensor):
+                        if buf.isnan().any() or buf.isinf().any():
+                            buf.zero_()
+                            reset_count += 1
+            if reset_count > 0:
+                logger.warning(
+                    f'[nan_sanitize] Zeroed {reset_count} NaN-contaminated '
+                    f'optimizer state buffers (exp_avg/exp_avg_sq)')
+        except Exception as e:
+            logger.warning(f'[nan_sanitize] Could not reset optimizer states: {e}')
 
     def old_policy(self):
         if self.template.sequence_parallel_size == 1:
