@@ -185,58 +185,118 @@ class SequenceParallel:
         try:
             from transformers import masking_utils
 
+            # transformers 5.x dropped ``cache_position`` from the mask
+            # interface in favour of ``q_length``/``q_offset`` and reshuffled
+            # ``create_causal_mask`` to take ``past_key_values`` 4th + a
+            # keyword ``position_ids``. Detect the new layout once and switch
+            # wrappers accordingly so a single fork supports both.
+            import inspect as _inspect
+            _new_mask_api = 'q_length' in _inspect.signature(masking_utils.flash_attention_mask).parameters
+
             _origin_flash_attention_mask = masking_utils.flash_attention_mask
 
-            def flash_attention_mask(batch_size,
-                                     cache_position,
-                                     kv_length,
-                                     kv_offset=0,
-                                     mask_function=masking_utils.causal_mask_function,
-                                     attention_mask=None,
-                                     **kwargs):
-                if self.world_size == 1:
-                    return _origin_flash_attention_mask(batch_size, cache_position, kv_length, kv_offset, mask_function,
-                                                        attention_mask, **kwargs)
-                if attention_mask is not None:
-                    if attention_mask.all():
-                        attention_mask = None
+            if _new_mask_api:
 
-                return attention_mask
+                def flash_attention_mask(batch_size,
+                                         q_length,
+                                         kv_length,
+                                         q_offset=0,
+                                         kv_offset=0,
+                                         mask_function=masking_utils.causal_mask_function,
+                                         attention_mask=None,
+                                         **kwargs):
+                    if self.world_size == 1:
+                        return _origin_flash_attention_mask(batch_size, q_length, kv_length, q_offset, kv_offset,
+                                                            mask_function, attention_mask, **kwargs)
+                    if attention_mask is not None and attention_mask.all():
+                        attention_mask = None
+                    return attention_mask
+            else:
+
+                def flash_attention_mask(batch_size,
+                                         cache_position,
+                                         kv_length,
+                                         kv_offset=0,
+                                         mask_function=masking_utils.causal_mask_function,
+                                         attention_mask=None,
+                                         **kwargs):
+                    if self.world_size == 1:
+                        return _origin_flash_attention_mask(batch_size, cache_position, kv_length, kv_offset,
+                                                            mask_function, attention_mask, **kwargs)
+                    if attention_mask is not None and attention_mask.all():
+                        attention_mask = None
+                    return attention_mask
 
             masking_utils.flash_attention_mask = flash_attention_mask
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['flash_attention_2'] = flash_attention_mask
 
-            def sdpa_mask(batch_size, cache_position, kv_length, *args, **kwargs):
-                if self.world_size == 1:
-                    return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
-                                                                                                     cache_position,
-                                                                                                     kv_length, *args,
-                                                                                                     **kwargs)
-                device = cache_position.device
-                cache_position = self.real_position_ids[0]
-                cache_position = self.pad(cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
-                cache_position = torch.arange(0, cache_position.shape[0], device=device)
-                kv_length = cache_position.shape[0]
-                return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
-                                                                                                 cache_position,
-                                                                                                 kv_length, *args,
-                                                                                                 **kwargs)
+            if _new_mask_api:
+
+                def sdpa_mask(batch_size, q_length, kv_length, *args, **kwargs):
+                    if self.world_size == 1:
+                        return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](
+                            batch_size, q_length, kv_length, *args, **kwargs)
+                    full_len = q_length * self.sp_world_size if isinstance(q_length, int) else q_length
+                    return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](
+                        batch_size, full_len, full_len, *args, **kwargs)
+            else:
+
+                def sdpa_mask(batch_size, cache_position, kv_length, *args, **kwargs):
+                    if self.world_size == 1:
+                        return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](
+                            batch_size, cache_position, kv_length, *args, **kwargs)
+                    device = cache_position.device
+                    cache_position = self.real_position_ids[0]
+                    cache_position = self.pad(cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
+                    cache_position = torch.arange(0, cache_position.shape[0], device=device)
+                    kv_length = cache_position.shape[0]
+                    return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](
+                        batch_size, cache_position, kv_length, *args, **kwargs)
 
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping[
                 'sdpa_origin'] = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
 
-            def create_causal_mask(config, input_embeds, attention_mask, cache_position, *args, **kwargs):
-                if self.world_size == 1:
+            if _new_mask_api:
+
+                def create_causal_mask(config,
+                                       inputs_embeds,
+                                       attention_mask,
+                                       past_key_values=None,
+                                       position_ids=None,
+                                       **kwargs):
+                    if self.world_size == 1:
+                        return masking_utils.origin_create_causal_mask(
+                            config,
+                            inputs_embeds,
+                            attention_mask,
+                            past_key_values=past_key_values,
+                            position_ids=position_ids,
+                            **kwargs)
+                    inputs_embeds = torch.ones(
+                        (inputs_embeds.shape[0], inputs_embeds.shape[1] * self.sp_world_size, inputs_embeds.shape[2]),
+                        dtype=inputs_embeds.dtype,
+                        device=inputs_embeds.device)
+                    return masking_utils.origin_create_causal_mask(
+                        config,
+                        inputs_embeds,
+                        attention_mask,
+                        past_key_values=past_key_values,
+                        position_ids=None,
+                        **kwargs)
+            else:
+
+                def create_causal_mask(config, input_embeds, attention_mask, cache_position, *args, **kwargs):
+                    if self.world_size == 1:
+                        return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask,
+                                                                       cache_position, *args, **kwargs)
+                    input_embeds = torch.ones(
+                        (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
+                        dtype=input_embeds.dtype,
+                        device=input_embeds.device)
+                    cache_position = torch.arange(0, input_embeds.shape[1], device=input_embeds.device)
                     return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
                                                                    *args, **kwargs)
-                input_embeds = torch.ones(
-                    (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
-                    dtype=input_embeds.dtype,
-                    device=input_embeds.device)
-                cache_position = torch.arange(0, input_embeds.shape[1], device=input_embeds.device)
-                return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                               *args, **kwargs)
 
             masking_utils.origin_create_causal_mask = masking_utils.create_causal_mask
             masking_utils.create_causal_mask = create_causal_mask

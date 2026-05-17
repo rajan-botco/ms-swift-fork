@@ -558,6 +558,34 @@ class Qwen3_5Template(Qwen3VLTemplate):
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
         return Qwen2VLTemplate._post_encode(self, model, inputs)
 
+    def _get_position_ids(self, inputs: Dict[str, Any]):
+        # transformers 5.x's Qwen3_5MoE.get_rope_index inserted a positional
+        # ``mm_token_type_ids`` arg right after ``input_ids``; the inherited
+        # Qwen2VL impl still binds the old (input_ids, image_grid_thw, ...)
+        # order and crashes on ``mm_token_type_ids[batch_idx]`` when the
+        # second positional turns out to be None. Build the modality mask
+        # from the input ids ourselves and call with the new signature.
+        base_model = self.get_base_model(self._get_model())
+        if hasattr(base_model, 'get_rope_index'):
+            get_rope_index = base_model.get_rope_index
+        else:
+            get_rope_index = base_model.model.get_rope_index
+        attention_mask = inputs.get('attention_mask_2d')
+        if attention_mask is None:
+            attention_mask = inputs.get('attention_mask')
+        input_ids = inputs['input_ids']
+        mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
+        mm_token_type_ids[input_ids == self.image_token_id] = 1
+        mm_token_type_ids[input_ids == self.video_token_id] = 2
+        position_ids, _ = get_rope_index(
+            input_ids,
+            mm_token_type_ids,
+            inputs.get('image_grid_thw'),
+            inputs.get('video_grid_thw'),
+            attention_mask=attention_mask,
+        )
+        return self._concat_text_position_ids(position_ids)
+
 
 register_template(
     QwenTemplateMeta(
